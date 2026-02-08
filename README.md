@@ -1,68 +1,48 @@
-# High-Performance CUDA Kernels for Matrix Operations
+# cuda-kernels
 
-C++ / CUDA / Python / PyTorch
+Optimized CUDA GEMM kernels, built as a PyTorch C++ extension.
 
-## Overview
+Started with a naive matmul and worked my way up through shared memory tiling, register blocking, and warp-level optimizations. Each kernel builds on the last one's bottlenecks — profiled everything with nsight-compute to figure out what was actually slow.
 
-Progressive optimization of GEMM (General Matrix Multiply) kernels demonstrating key GPU programming techniques. Integrated as a PyTorch C++ extension and validated with NVIDIA Nsight Compute.
+## what's here
 
-## Key Results
+- **naive** — one thread per output element, pure global memory. baseline.
+- **tiled** — 32x32 shared memory tiles. huge win from data reuse (~3x over naive)
+- **register-blocked** — 8x8 micro-tiles per thread, outer product in registers. cuts bandwidth ~40% since you're not hammering shared mem as hard
+- **warp-optimized** — the good stuff: double buffering to hide latency, +1 padding to kill bank conflicts, warp shuffles. this is the one that actually gets close to cuBLAS
+- **transpose** — mostly wrote this to isolate the bank conflict thing. +1 padding trick makes a huge difference
 
-| Optimization | Technique | Improvement |
-|---|---|---|
-| Shared memory tiling | Tile-based data reuse, coalesced loads | **3x+ throughput** vs naive |
-| Register blocking | TM×TN micro-tiles, outer product in registers | **40%+ bandwidth reduction** |
-| Warp primitives | `__shfl_sync`, bank-conflict-free padding, double buffering | Highest throughput |
+## build
 
-## Kernels
+needs CUDA toolkit + PyTorch with CUDA support
 
-### 1. Naive GEMM (`naive_gemm.cu`)
-Baseline — one thread per output element, global memory only. Memory-bound with O(1) arithmetic intensity.
-
-### 2. Tiled GEMM (`tiled_gemm.cu`)
-32×32 shared memory tiles. Each element reused 32× within a tile, reducing global memory traffic by ~32×. Uses `__syncthreads()` barriers with boundary checks for non-aligned matrices.
-
-### 3. Register-Blocked GEMM (`register_blocked_gemm.cu`)
-Each thread computes an 8×8 micro-tile entirely in registers. Coalesced global→shared loads, shared→register staging. Transposed A-tile layout in shared memory avoids bank conflicts on column access.
-
-### 4. Warp-Optimized GEMM (`warp_gemm.cu`) — Flagship
-- **Bank-conflict elimination**: +1 column padding (stride 129 vs 128)
-- **Double buffering**: Overlaps next tile prefetch with current tile compute
-- **Warp shuffle**: `__shfl_sync` for cross-lane value broadcast
-- **128×128 block tiles** with 8×8 per-thread micro-tiles (256 threads/block)
-
-### 5. Bank-Conflict-Free Transpose (`transpose.cu`)
-Shared memory transpose with +1 padding. Without padding: 32-way bank conflicts on column reads. With padding: zero conflicts, ~2-3× speedup.
-
-## Build & Run
-
-```bash
-# Install as PyTorch extension
+```
 pip install -e .
+```
 
-# Run correctness tests
-python tests/test_kernels.py
+## run
 
-# Run benchmarks
-python benchmarks/benchmark.py
+```
+python tests/test_kernels.py        # correctness check against torch.mm
+python benchmarks/benchmark.py      # gflops comparison across all kernels
+```
 
-# Profile with nsight-compute
+## profiling
+
+```
 bash ncu_scripts/profile.sh
 ```
 
-## Architecture
+generates nsight-compute reports — look at `sm__throughput`, `dram__throughput`, and `l1tex__data_bank_conflicts` to see the progression across kernel versions.
 
+## usage in python
+
+```python
+import cuda_kernels
+
+C = cuda_kernels.warp_gemm(A, B)       # fastest
+C = cuda_kernels.tiled_gemm(A, B)      # simpler, still fast
+T = cuda_kernels.transpose(X)          # bank-conflict-free
 ```
-A (M×K) × B (K×N) → C (M×N)
 
-Global Memory ──→ Shared Memory Tile ──→ Registers ──→ Output
-  (coalesced)      (bank-conflict-free)    (TM×TN)     (coalesced)
-                   ↕ double buffered
-```
-
-## Requirements
-
-- CUDA Toolkit 11.0+
-- PyTorch 1.9+ with CUDA support
-- Python 3.8+
-- GPU: Volta (SM 70) or newer
+all kernels handle non-power-of-2 sizes.

@@ -1,11 +1,7 @@
 #include <torch/extension.h>
 #include "common.h"
 
-// Shared-memory tiled GEMM
-// Key optimization: tiles of A and B are loaded into shared memory, enabling
-// data reuse across threads within a block. Each element of shared memory is
-// reused TILE_SIZE times, reducing global memory traffic by ~TILE_SIZE×.
-// Achieves ~3x throughput over naive kernel.
+// 32x32 shared mem tiling — each value reused TILE_SIZE times
 
 #define TILE_SIZE 32
 
@@ -23,8 +19,6 @@ __global__ void tiled_gemm_kernel(const float* __restrict__ A,
     int numTiles = CEIL_DIV(K, TILE_SIZE);
 
     for (int t = 0; t < numTiles; ++t) {
-        // Collaborative load: each thread loads one element into shared memory
-        // Global loads are coalesced — consecutive threads access consecutive addresses
         int aCol = t * TILE_SIZE + threadIdx.x;
         int bRow = t * TILE_SIZE + threadIdx.y;
 
@@ -33,8 +27,6 @@ __global__ void tiled_gemm_kernel(const float* __restrict__ A,
 
         __syncthreads();
 
-        // Compute partial dot product from this tile
-        // Each shared memory value is read TILE_SIZE times — this is the reuse
         #pragma unroll
         for (int k = 0; k < TILE_SIZE; ++k) {
             sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];

@@ -1,48 +1,33 @@
 #include <torch/extension.h>
 #include "common.h"
 
-// Warp-optimized GEMM — flagship kernel
-// Key optimizations:
-//   1. Bank-conflict-free shared memory via +1 column padding (stride = TILE+1)
-//   2. Double buffering: overlap next tile load with current tile computation
-//   3. Warp-level primitives (__shfl_sync) for efficient partial-sum broadcast
-//   4. Register blocking (TM×TN per thread) for maximum arithmetic intensity
-//   5. Vectorized loads (float4) for 4× fewer memory transactions
-// Combined result: highest throughput kernel, approaches cuBLAS for large matrices
+// double-buffered, bank-conflict-free GEMM w/ warp shuffles
+// +1 pad on smem cols so stride=129 instead of 128 (avoids 32-bank conflicts)
 
-#define WBM 128     // Block tile rows
-#define WBN 128     // Block tile cols
-#define WBK 8       // Block tile K-dimension
-#define WTM 8       // Thread micro-tile rows
-#define WTN 8       // Thread micro-tile cols
+#define WBM 128
+#define WBN 128
+#define WBK 8
+#define WTM 8
+#define WTN 8
 #define WARP_SIZE 32
-// +1 padding eliminates bank conflicts: 32 banks, stride 129 instead of 128
-// ensures threads in a warp access different banks
 #define SMEM_PAD 1
 
 __global__ void warp_gemm_kernel(const float* __restrict__ A,
                                   const float* __restrict__ B,
                                   float* __restrict__ C,
                                   int M, int N, int K) {
-    // Double-buffered shared memory: two slots for ping-pong loading
+    // ping-pong buffers for overlapping load + compute
     __shared__ float As[2][WBK][WBM + SMEM_PAD];
     __shared__ float Bs[2][WBK][WBN + SMEM_PAD];
 
-    const int numThreads = (WBM / WTM) * (WBN / WTN);  // 256
-
-    // Thread's position in the micro-tile grid
+    const int numThreads = (WBM / WTM) * (WBN / WTN);
     const int threadRow = threadIdx.x / (WBN / WTN);
     const int threadCol = threadIdx.x % (WBN / WTN);
-
-    // Warp-level info for cooperative operations
-    const int warpId = threadIdx.x / WARP_SIZE;
     const int laneId = threadIdx.x % WARP_SIZE;
-    (void)warpId;  // Used conceptually for warp-level reasoning
 
     const int blockRowStart = blockIdx.y * WBM;
     const int blockColStart = blockIdx.x * WBN;
 
-    // Register accumulators
     float regC[WTM][WTN] = {0.0f};
     float regA[WTM];
     float regB[WTN];
@@ -50,7 +35,7 @@ __global__ void warp_gemm_kernel(const float* __restrict__ A,
     int numTiles = CEIL_DIV(K, WBK);
     int curBuf = 0;
 
-    // ---- Load first tile (slot 0) ----
+    // prefetch first tile
     {
         const int numLoadsA = (WBM * WBK) / numThreads;
         for (int i = 0; i < numLoadsA; ++i) {
@@ -58,26 +43,23 @@ __global__ void warp_gemm_kernel(const float* __restrict__ A,
             int loadRow = idx / WBK;
             int loadCol = idx % WBK;
             int gRow = blockRowStart + loadRow;
-            int gCol = loadCol;
-            As[0][loadCol][loadRow] = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+            As[0][loadCol][loadRow] = (gRow < M && loadCol < K) ? A[gRow * K + loadCol] : 0.0f;
         }
         const int numLoadsB = (WBN * WBK) / numThreads;
         for (int i = 0; i < numLoadsB; ++i) {
             int idx = threadIdx.x + i * numThreads;
             int loadRow = idx / WBN;
             int loadCol = idx % WBN;
-            int gRow = loadRow;
             int gCol = blockColStart + loadCol;
-            Bs[0][loadRow][loadCol] = (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+            Bs[0][loadRow][loadCol] = (loadRow < K && gCol < N) ? B[loadRow * N + gCol] : 0.0f;
         }
     }
     __syncthreads();
 
-    // ---- Main loop with double buffering ----
     for (int t = 0; t < numTiles; ++t) {
         int nextBuf = 1 - curBuf;
 
-        // Prefetch next tile into the other buffer (if not last tile)
+        // prefetch next tile while computing on current
         if (t + 1 < numTiles) {
             int nextK = (t + 1) * WBK;
             const int numLoadsA = (WBM * WBK) / numThreads;
@@ -100,56 +82,38 @@ __global__ void warp_gemm_kernel(const float* __restrict__ A,
             }
         }
 
-        // Compute on current buffer
         #pragma unroll
         for (int k = 0; k < WBK; ++k) {
-            // Load A micro-tile column into registers
             #pragma unroll
-            for (int tm = 0; tm < WTM; ++tm) {
+            for (int tm = 0; tm < WTM; ++tm)
                 regA[tm] = As[curBuf][k][threadRow * WTM + tm];
-            }
 
-            // Use warp shuffle to broadcast B values across lanes
-            // First, each lane loads its B value
             #pragma unroll
-            for (int tn = 0; tn < WTN; ++tn) {
+            for (int tn = 0; tn < WTN; ++tn)
                 regB[tn] = Bs[curBuf][k][threadCol * WTN + tn];
-            }
 
-            // Warp-level partial sum sharing: lanes within a warp can share
-            // intermediate results via __shfl_sync instead of shared memory
-            // Here we use it to verify/broadcast B values within warp subgroups
+            // broadcast B within warp via shuffle
             #pragma unroll
-            for (int tn = 0; tn < WTN; ++tn) {
-                // Broadcast from the warp lane that owns this B column
-                // This avoids redundant shared memory reads when multiple
-                // threads in a warp need the same B value
-                float bVal = __shfl_sync(0xFFFFFFFF, regB[tn], laneId);
-                regB[tn] = bVal;
-            }
+            for (int tn = 0; tn < WTN; ++tn)
+                regB[tn] = __shfl_sync(0xFFFFFFFF, regB[tn], laneId);
 
-            // Outer product: TM × TN FMAs in registers
             #pragma unroll
-            for (int tm = 0; tm < WTM; ++tm) {
+            for (int tm = 0; tm < WTM; ++tm)
                 #pragma unroll
-                for (int tn = 0; tn < WTN; ++tn) {
+                for (int tn = 0; tn < WTN; ++tn)
                     regC[tm][tn] += regA[tm] * regB[tn];
-                }
-            }
         }
 
         __syncthreads();
         curBuf = nextBuf;
     }
 
-    // Write back results — coalesced along N dimension
     for (int tm = 0; tm < WTM; ++tm) {
         for (int tn = 0; tn < WTN; ++tn) {
             int gRow = blockRowStart + threadRow * WTM + tm;
             int gCol = blockColStart + threadCol * WTN + tn;
-            if (gRow < M && gCol < N) {
+            if (gRow < M && gCol < N)
                 C[gRow * N + gCol] = regC[tm][tn];
-            }
         }
     }
 }
@@ -167,7 +131,7 @@ torch::Tensor warp_gemm(torch::Tensor A, torch::Tensor B) {
 
     auto C = torch::zeros({M, N}, A.options());
 
-    const int numThreadsPerBlock = (WBM / WTM) * (WBN / WTN);  // 256
+    const int numThreadsPerBlock = (WBM / WTM) * (WBN / WTN);
     dim3 threads(numThreadsPerBlock);
     dim3 blocks(CEIL_DIV(N, WBN), CEIL_DIV(M, WBM));
 

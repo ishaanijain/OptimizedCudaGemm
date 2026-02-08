@@ -1,10 +1,7 @@
 #include <torch/extension.h>
 #include "common.h"
 
-// Bank-conflict-free matrix transpose
-// Without padding: threads in a warp access same bank on column reads → 32-way conflict
-// With +1 padding: stride becomes 33, distributing accesses across all 32 banks → zero conflicts
-// Result: ~2-3x speedup over naive transpose
+// smem transpose w/ +1 padding to avoid bank conflicts
 
 #define TRANS_TILE 32
 #define TRANS_PAD 1
@@ -12,24 +9,20 @@
 __global__ void transpose_kernel(const float* __restrict__ input,
                                   float* __restrict__ output,
                                   int rows, int cols) {
-    // +1 padding eliminates bank conflicts on column access
     __shared__ float tile[TRANS_TILE][TRANS_TILE + TRANS_PAD];
 
     int xIdx = blockIdx.x * TRANS_TILE + threadIdx.x;
     int yIdx = blockIdx.y * TRANS_TILE + threadIdx.y;
 
-    // Coalesced read from global → shared (row-major)
     if (xIdx < cols && yIdx < rows) {
         tile[threadIdx.y][threadIdx.x] = input[yIdx * cols + xIdx];
     }
 
     __syncthreads();
 
-    // Transposed indices for output
     xIdx = blockIdx.y * TRANS_TILE + threadIdx.x;
     yIdx = blockIdx.x * TRANS_TILE + threadIdx.y;
 
-    // Coalesced write from shared → global (column read from tile is now bank-conflict-free)
     if (xIdx < rows && yIdx < cols) {
         output[yIdx * rows + xIdx] = tile[threadIdx.x][threadIdx.y];
     }

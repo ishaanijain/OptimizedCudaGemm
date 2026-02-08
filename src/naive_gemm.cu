@@ -1,9 +1,7 @@
 #include <torch/extension.h>
 #include "common.h"
 
-// Naive GEMM: one thread computes one output element
-// No data reuse — each thread loads full row of A and column of B from global memory
-// Arithmetic intensity: O(1) — memory bound baseline
+// baseline — one thread per output element, no shared mem
 __global__ void naive_gemm_kernel(const float* __restrict__ A,
                                    const float* __restrict__ B,
                                    float* __restrict__ C,
